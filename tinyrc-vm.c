@@ -28,6 +28,12 @@ enum {
   FL_NEG = 1 << 2, /* N */
 };
 
+/* Processor Status Register */
+
+#define PSR_SUPERVISOR (1 << 15)
+#define PSR_PRIORITY_MASK 0x0700
+#define PSR_COND_MASK 0x0007
+
 /* Opcodes */
 
 enum {
@@ -50,7 +56,16 @@ enum {
 };
 
 /* Memory Mapped Registers */
-enum { MR_KBSR = 0xFE00, MR_KBDR = 0xFE02 };
+enum {
+  MR_KBSR = 0xFE00,
+  MR_KBDR = 0xFE02,
+  MR_DSR = 0xFE04,
+  MR_DDR = 0xFE06,
+  MR_TR = 0xFE08,
+  MR_TMI = 0xFE0A,
+  MR_MPR = 0xFE12,
+  MR_MCR = 0xFFFE
+};
 
 /* TRAP Codes */
 
@@ -63,12 +78,91 @@ enum {
   TRAP_HALT = 0x25
 };
 
+/* Exception Vector */
+enum { EXC_PROTECTION = 0x00, INT_TIMER = 0x01 };
+#define EXCEPTION_VECTOR_BASE 0x0100
+
+/* Machine Mode */
+enum { MODE_SUPERVISOR = 0, MODE_USER = 1 };
+
 /* Memory Storage */
 #define MEMORY_MAX (1 << 16)
 uint16_t memory[MEMORY_MAX]; /* 65536 locations */
 
 /* Register Storage */
 uint16_t reg[R_COUNT];
+
+uint16_t psr;
+
+int exception_raised = 0;
+
+uint16_t ssp;
+uint16_t usp;
+
+uint16_t timer_ticks = 0;
+
+#define SUPERVISOR_STACK_START 0xFDFF
+#define USER_STACK_START 0xBFFF
+
+/* Trap Return Stack */
+#define TRAP_STACK_MAX 32
+
+uint16_t trap_mode_stack[TRAP_STACK_MAX];
+uint16_t trap_return_pc_stack[TRAP_STACK_MAX];
+uint16_t trap_depth = 0;
+
+/* Change Mode */
+
+int
+is_supervisor_mode(void) {
+  return (psr & PSR_SUPERVISOR) != 0;
+}
+
+void
+enter_supervisor_mode(void) {
+  psr |= PSR_SUPERVISOR;
+  // fprintf(stderr, "[VM] enter supervisor\n");
+}
+
+void
+enter_user_mode(void) {
+  psr &= ~PSR_SUPERVISOR;
+  // fprintf(stderr, "[VM] enter user\n");
+}
+
+void
+set_condition(uint16_t cond) {
+  reg[R_COND] = cond;
+  psr = (psr & ~PSR_COND_MASK) | cond;
+}
+
+void
+push_trap_state(uint16_t return_pc) {
+  if (trap_depth >= TRAP_STACK_MAX) {
+    abort();
+  }
+
+  trap_mode_stack[trap_depth] = psr & PSR_SUPERVISOR;
+  trap_return_pc_stack[trap_depth] = return_pc;
+  ++trap_depth;
+}
+
+void
+maybe_pop_trap_state(uint16_t target_pc) {
+  if (trap_depth == 0) {
+    return;
+  }
+
+  if (target_pc != trap_return_pc_stack[trap_depth - 1]) {
+    return;
+  }
+
+  --trap_depth;
+
+  psr = (psr & ~PSR_SUPERVISOR) | trap_mode_stack[trap_depth];
+  // fprintf(stderr, "[VM] trap return, mode=%s\n",
+  //        is_supervisor_mode() ? "supervisor" : "user");
+}
 
 /* Input Buffering */
 
@@ -167,11 +261,11 @@ swap16(uint16_t x) {
 void
 update_flags(uint16_t r) {
   if (reg[r] == 0) {
-    reg[R_COND] = FL_ZRO;
+    set_condition(FL_ZRO);
   } else if (reg[r] >> 15) {
-    reg[R_COND] = FL_NEG;
+    set_condition(FL_NEG);
   } else {
-    reg[R_COND] = FL_POS;
+    set_condition(FL_POS);
   }
 }
 
@@ -182,7 +276,7 @@ read_image_file(FILE *file) {
   fread(&origin, sizeof(origin), 1, file);
   origin = swap16(origin);
 
-  uint16_t max_read = MEMORY_MAX - origin;
+  size_t max_read = MEMORY_MAX - origin;
   uint16_t *p = memory + origin;
   size_t read = fread(p, sizeof(uint16_t), max_read, file);
 
@@ -204,13 +298,123 @@ read_image(const char *image_path) {
 }
 
 /* Memory Access */
+int
+mpr_allows_user_access(uint16_t address) {
+  uint16_t segment = address >> 12;
+  uint16_t mask = 1 << segment;
+
+  return (memory[MR_MPR] & mask) != 0;
+}
+
+void
+push_exception_frame(uint16_t saved_pc, uint16_t saved_psr) {
+  if ((saved_psr & PSR_SUPERVISOR) == 0) {
+    usp = reg[R_R6];
+    reg[R_R6] = ssp;
+  }
+
+  memory[--reg[R_R6]] = saved_psr;
+  memory[--reg[R_R6]] = saved_pc;
+
+  ssp = reg[R_R6];
+}
+
+void
+raise_interrupt(uint16_t vector) {
+  uint16_t saved_pc = reg[R_PC];
+  uint16_t saved_psr = psr;
+
+  push_exception_frame(saved_pc, saved_psr);
+
+  enter_supervisor_mode();
+
+  reg[R_PC] = memory[EXCEPTION_VECTOR_BASE + vector];
+}
+
+void
+raise_exception(uint16_t vector) {
+  uint16_t saved_pc = reg[R_PC];
+  uint16_t saved_psr = psr;
+
+  push_exception_frame(saved_pc, saved_psr);
+
+  enter_supervisor_mode();
+
+  exception_raised = 1;
+  reg[R_PC] = memory[EXCEPTION_VECTOR_BASE + vector];
+}
+
+void
+protection_fault(uint16_t address) {
+  (void)address;
+  raise_exception(EXC_PROTECTION);
+}
+
+int
+is_device_register(uint16_t address) {
+  return address >= 0xFE00;
+}
+
+void
+check_memory_access(uint16_t address) {
+  if (is_supervisor_mode()) {
+    return;
+  }
+
+  if (!mpr_allows_user_access(address)) {
+    protection_fault(address);
+    return;
+  }
+
+  if (is_device_register(address)) {
+    protection_fault(address);
+    return;
+  }
+}
+
 void
 mem_write(uint16_t address, uint16_t val) {
+  check_memory_access(address);
+
+  if (exception_raised) {
+    return;
+  }
+
+  if (address == MR_DDR) {
+    putc((char)(val & 0xFF), stdout);
+    fflush(stdout);
+    memory[MR_DDR] = val;
+    return;
+  }
+
+  if (address == MR_TMI) {
+    memory[MR_TMI] = val;
+    timer_ticks = 0;
+    memory[MR_TR] = 0;
+    return;
+  }
+
+  if (address == MR_TR) {
+    memory[MR_TR] = val;
+    return;
+  }
+
+  if (address == MR_MCR) {
+    memory[MR_MCR] = val;
+    return;
+  }
+
   memory[address] = val;
 }
 
 uint16_t
 mem_read(uint16_t address) {
+  check_memory_access(address);
+
+  if (exception_raised) {
+    return 0;
+  }
+
   if (address == MR_KBSR) {
     if (check_key()) {
       memory[MR_KBSR] = (1 << 15);
@@ -219,7 +423,31 @@ mem_read(uint16_t address) {
       memory[MR_KBSR] = 0;
     }
   }
+
+  if (address == MR_DSR) {
+    memory[MR_DSR] = (1 << 15);
+  }
+
   return memory[address];
+}
+
+void
+service_timer(void) {
+  uint16_t interval = memory[MR_TMI];
+
+  if (interval == 0) {
+    return;
+  }
+
+  ++timer_ticks;
+  memory[MR_TR] = timer_ticks;
+
+  if (timer_ticks >= interval) {
+    timer_ticks = 0;
+    memory[MR_TR] = 0;
+
+    raise_interrupt(INT_TIMER);
+  }
 }
 
 int
@@ -230,7 +458,7 @@ main(int argc, char *argv[]) {
     exit(2);
   }
 
-  for (size_t j = 1; j < argc; ++j) {
+  for (int j = 1; j < argc; ++j) {
     if (!read_image(argv[j])) {
       printf("failed to load image: %s\n", argv[j]);
       exit(1);
@@ -244,17 +472,33 @@ main(int argc, char *argv[]) {
 
   /* since exactly one condition flag should be set at any given time, set the Z
    * flag */
+  psr = PSR_SUPERVISOR | FL_ZRO;
   reg[R_COND] = FL_ZRO;
+  ssp = SUPERVISOR_STACK_START;
+  usp = USER_STACK_START;
+  reg[R_R6] = ssp;
 
   /* set the PC to starting position */
   /* 0x3000 is the default */
-  enum { PC_START = 0x3000 };
-  reg[R_PC] = PC_START;
+  enum { PC_START_USER = 0x3000, PC_START_OS = 0x0200 };
+  /* set the PC to OS entry point */
+  reg[R_PC] = PC_START_OS;
 
   int running = 1;
-  while (running) {
+
+  /* machine starts running */
+  memory[MR_MCR] = 1 << 15;
+
+  while (running && (memory[MR_MCR] & (1 << 15))) {
+    exception_raised = 0;
+
+    uint16_t psr_at_fetch = psr;
+
     /* FETCH */
     uint16_t instr = mem_read(reg[R_PC]++);
+    if (exception_raised) {
+      continue;
+    }
     uint16_t op = instr >> 12;
 
     switch (op) {
@@ -282,7 +526,7 @@ main(int argc, char *argv[]) {
         uint16_t imm5 = sign_extend(instr & 0x1F, 5);
         reg[r0] = reg[r1] & imm5;
       } else {
-        uint64_t r2 = instr & 0x7;
+        uint16_t r2 = instr & 0x7;
         reg[r0] = reg[r1] & reg[r2];
       }
       update_flags(r0);
@@ -296,13 +540,35 @@ main(int argc, char *argv[]) {
     case OP_BR: {
       uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
       uint16_t cond_flag = (instr >> 9) & 0x7;
-      if (cond_flag & reg[R_COND]) {
+      uint16_t cond = psr & PSR_COND_MASK;
+
+      if (cond_flag & cond) {
         reg[R_PC] += pc_offset;
       }
     } break;
     case OP_JMP: {
-      uint16_t r1 = (instr >> 6) & 0x7;
-      reg[R_PC] = reg[r1];
+      uint16_t base_r = (instr >> 6) & 0x7;
+      uint16_t low6 = instr & 0x3F;
+
+      if (low6 == 0x01) {
+        /* JMPT BaseR */
+        ssp = reg[R_R6];
+        reg[R_R6] = usp;
+
+        reg[R_PC] = reg[base_r];
+        enter_user_mode();
+      } else if (low6 == 0x00) {
+        /* JMP BaseR / RET */
+        uint16_t target_pc = reg[base_r];
+
+        reg[R_PC] = target_pc;
+
+        if (base_r == R_R7) {
+          maybe_pop_trap_state(target_pc);
+        }
+      } else {
+        abort();
+      }
     } break;
     case OP_JSR: {
       uint16_t long_flag = (instr >> 11) & 1;
@@ -318,20 +584,42 @@ main(int argc, char *argv[]) {
     case OP_LD: {
       uint16_t r0 = (instr >> 9) & 0x7;
       uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
-      reg[r0] = mem_read(reg[R_PC] + pc_offset);
+
+      uint16_t value = mem_read(reg[R_PC] + pc_offset);
+      if (exception_raised) {
+        break;
+      }
+
+      reg[r0] = value;
       update_flags(r0);
     } break;
     case OP_LDI: {
       uint16_t r0 = (instr >> 9) & 0x7;
-      uint64_t pc_offset = sign_extend(instr & 0x1FF, 9);
-      reg[r0] = mem_read(mem_read(reg[R_PC] + pc_offset));
+      uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
+
+      uint16_t pointer = mem_read(reg[R_PC] + pc_offset);
+      if (exception_raised) {
+        break;
+      }
+      uint16_t value = mem_read(pointer);
+      if (exception_raised) {
+        break;
+      }
+
+      reg[r0] = value;
       update_flags(r0);
     } break;
     case OP_LDR: {
       uint16_t r0 = (instr >> 9) & 0x7;
       uint16_t r1 = (instr >> 6) & 0x7;
       uint16_t offset = sign_extend(instr & 0x3F, 6);
-      reg[r0] = mem_read(reg[r1] + offset);
+
+      uint16_t value = mem_read(reg[r1] + offset);
+      if (exception_raised) {
+        break;
+      }
+
+      reg[r0] = value;
       update_flags(r0);
     } break;
     case OP_LEA: {
@@ -344,69 +632,72 @@ main(int argc, char *argv[]) {
       uint16_t r0 = (instr >> 9) & 0x7;
       uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
       mem_write(reg[R_PC] + pc_offset, reg[r0]);
+      if (exception_raised) {
+        break;
+      }
     } break;
     case OP_STI: {
       uint16_t r0 = (instr >> 9) & 0x7;
       uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
-      mem_write(mem_read(reg[R_PC] + pc_offset), reg[r0]);
+      uint16_t pointer = mem_read(reg[R_PC] + pc_offset);
+      if (exception_raised) {
+        break;
+      }
+
+      mem_write(pointer, reg[r0]);
+      if (exception_raised) {
+        break;
+      }
     } break;
     case OP_STR: {
       uint16_t r0 = (instr >> 9) & 0x7;
       uint16_t r1 = (instr >> 6) & 0x7;
       uint16_t offset = sign_extend(instr & 0x3F, 6);
       mem_write(reg[r1] + offset, reg[r0]);
-    } break;
-    case OP_TRAP: {
-      reg[R_R7] = reg[R_PC];
-      switch (instr & 0xFF) {
-      case TRAP_GETC: {
-        reg[R_R0] = (uint16_t)getchar();
-        update_flags(R_R0);
-      } break;
-      case TRAP_OUT: {
-        putc((char)reg[R_R0], stdout);
-        fflush(stdout);
-      } break;
-      case TRAP_PUTS: {
-        uint16_t *c = memory + reg[R_R0];
-        while (*c) {
-          putc((char)*c, stdout);
-          ++c;
-        }
-        fflush(stdout);
-      } break;
-      case TRAP_IN: {
-        printf("Enter a character: ");
-        char c = getchar();
-        putc(c, stdout);
-        fflush(stdout);
-        reg[R_R0] = (uint16_t)c;
-        update_flags(R_R0);
-      } break;
-      case TRAP_PUTSP: {
-        uint16_t *c = memory + reg[R_R0];
-        while (*c) {
-          char char1 = (*c) & 0xFF;
-          putc(char1, stdout);
-          char char2 = (*c) >> 8;
-          if (char2)
-            putc(char2, stdout);
-          ++c;
-        }
-        fflush(stdout);
-      } break;
-      case TRAP_HALT: {
-        puts("HALT");
-        fflush(stdout);
-        running = 0;
-      } break;
+      if (exception_raised) {
+        break;
       }
     } break;
-    case OP_RES:
-    case OP_RTI:
+    case OP_TRAP: {
+      uint16_t trapvect8 = instr & 0xFF;
+      uint16_t return_pc = reg[R_PC];
+      push_trap_state(return_pc);
+      reg[R_R7] = return_pc;
+      enter_supervisor_mode();
+      reg[R_PC] = mem_read(trapvect8);
+    } break;
+    case OP_RES: {
+      abort();
+    } break;
+    case OP_RTI: {
+      if (!is_supervisor_mode()) {
+        raise_exception(EXC_PROTECTION);
+        break;
+      }
+
+      uint16_t saved_pc = memory[reg[R_R6]++];
+      uint16_t saved_psr = memory[reg[R_R6]++];
+
+      ssp = reg[R_R6];
+
+      reg[R_PC] = saved_pc;
+      psr = saved_psr;
+      reg[R_COND] = psr & PSR_COND_MASK;
+
+      if (!is_supervisor_mode()) {
+        reg[R_R6] = usp;
+      }
+    } break;
     default:
       abort();
       break;
     }
+    if (!exception_raised && ((psr_at_fetch & PSR_SUPERVISOR) == 0) &&
+        !is_supervisor_mode()) {
+      service_timer();
+    }
   }
+
+  restore_input_buffering();
+  return 0;
 }
