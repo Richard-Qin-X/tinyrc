@@ -1,0 +1,7 @@
+.ORIG x3000
+
+RTI
+
+HALT
+
+.END

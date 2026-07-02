@@ -1,0 +1,17 @@
+.ORIG x3000
+
+LEA R0, PROMPT
+PUTS
+
+GETC
+OUT
+
+LEA R0, DONE
+PUTS
+
+HALT
+
+PROMPT .STRINGZ "Press one key: "
+DONE   .STRINGZ "\nDone.\n"
+
+.END
